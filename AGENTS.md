@@ -5,11 +5,16 @@ worked on. Keep this file under 100 lines.
 
 ## Shape
 
-- `src/VlessServer.php` runs the listener, non-blocking TLS handshake, VLESS header parser,
-  `Pig\Async\Dns` lookup and dual-`TcpConnection` relay.
+- `src/VlessServer.php` runs the listener, non-blocking TLS or REALITY handshake, VLESS header
+  (+ protobuf `Addons.Flow`) parser, `Pig\Async\Dns` lookup and dual-`TcpConnection` relay.
+- `src/Reality.php` implements the pure-PHP TLS 1.3 + REALITY record-layer protocol (`ext-openssl`
+  X25519 ECDH, HKDF-SHA256/384, AES-GCM/ChaCha20-Poly1305, HMAC-SHA512 temporary Ed25519 X.509
+  certificate, transparent fallback to `dest`, and zero-copy splice switches).
+- `src/Vision.php` implements XTLS Vision (`xtls-rprx-vision`) padding/unpadding, inner TLS 1.3
+  detection, and `CMD_DIRECT` zero-copy splice transition.
 - `src/Raw.php` is the unframed TCP protocol; `src/WsBinary.php` is the RFC 6455 binary
   WebSocket protocol (with `Sec-WebSocket-Protocol` 0-RTT early data).
-- `extensions/pig-vless.php` registers the autoloader, the session hooks and `/vless`.
+- `extensions/pig-vless.php` registers the autoloader, the session hooks and `/vless` (`start | stop | restart | status | keygen`).
 
 ## Rules
 

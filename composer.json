@@ -1,9 +1,9 @@
 {
     "name": "owner888/pig-vless",
-    "description": "A minimal VLESS inbound (TCP, TLS, WebSocket with 0-RTT early data, and non-blocking DNS) for the pig coding agent, so a phone running Shadowrocket, v2rayNG or sing-box can route through the machine pig runs on.",
+    "description": "A minimal VLESS inbound (TCP, REALITY + XTLS Vision, TLS, WebSocket with 0-RTT early data, and non-blocking DNS) for the pig coding agent, so a phone running Shadowrocket, v2rayNG or sing-box can route through the machine pig runs on.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["pig", "pig-package", "vless", "proxy", "websocket", "tls", "coding-agent"],
+    "keywords": ["pig", "pig-package", "vless", "reality", "xtls-vision", "proxy", "websocket", "tls", "coding-agent"],
     "authors": [
         {"name": "the developer"}
     ],

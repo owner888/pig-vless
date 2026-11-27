@@ -13,8 +13,8 @@ use Pig\CodingAgent\Web\Protocols\Http;
 use Pig\CodingAgent\Web\TcpConnection;
 
 /**
- * A VLESS inbound, the smallest one that a phone can use: TCP or WebSocket, one UUID, TLS if a
- * certificate is configured and plain if not.
+ * A VLESS inbound, the smallest one that a phone can use: TCP or WebSocket, one UUID, REALITY +
+ * XTLS Vision (`xtls-rprx-vision`), TLS if a certificate is configured, or plain.
  *
  * VLESS is the thinnest of the V2Ray protocols — a header and then bytes:
  *
@@ -27,11 +27,13 @@ use Pig\CodingAgent\Web\TcpConnection;
  * per-packet framing on both ends, and MUX a whole multiplexer, and neither is "a phone
  * through the Mac". Shadowrocket falls back to direct for UDP when the proxy declines it.
  *
- * The relay is two `TcpConnection`s — over `Raw` for plain TCP/TLS, or `WsBinary` (RFC 6455
- * binary frames after an HTTP upgrade on `$wsPath`, with `Sec-WebSocket-Protocol` 0-RTT early
- * data) for WebSocket — one for the phone, one for where it asked to go, each writing what the
- * other reads. Domain names are resolved off the loop through `Pig\Async\Dns`, and the outbound
- * connect is asynchronous (`STREAM_CLIENT_ASYNC_CONNECT`, then one writable wakeup).
+ * The relay is two `TcpConnection`s — over `Reality` (pure-PHP TLS 1.3 + REALITY authentication
+ * with transparent dest fallback and XTLS Vision zero-copy splice), `Raw` for plain TCP/TLS, or
+ * `WsBinary` (RFC 6455 binary frames after an HTTP upgrade on `$wsPath`, with
+ * `Sec-WebSocket-Protocol` 0-RTT early data) for WebSocket — one for the phone, one for where it
+ * asked to go, each writing what the other reads. Domain names are resolved off the loop through
+ * `Pig\Async\Dns`, and the outbound connect is asynchronous (`STREAM_CLIENT_ASYNC_CONNECT`, then
+ * one writable wakeup).
  */
 final class VlessServer
 {
@@ -61,9 +63,29 @@ final class VlessServer
     public readonly ?string $wsPath;
 
     /**
-     * @param string      $uuid   as written, with or without dashes
-     * @param string|null $cert   PEM path; with `$key` turns the listener into TLS
-     * @param string|null $wsPath when set, expects a WebSocket upgrade at this path (`type=ws`)
+     * Normalized REALITY settings when enabled, or null.
+     *
+     * @var array{
+     *     privateKeyRaw: string,
+     *     publicKey: string,
+     *     destHost: string,
+     *     destPort: int,
+     *     serverNames: list<string>,
+     *     shortIds: list<string>,
+     *     primaryShortIdHex: string,
+     *     fingerprint: string,
+     *     flow: string,
+     *     maxTimeDiff: int
+     * }|null
+     */
+    public readonly ?array $reality;
+
+    /**
+     * @param string                    $uuid    as written, with or without dashes
+     * @param string|null               $cert    PEM path; with `$key` turns the listener into TLS
+     * @param string|null               $key     PEM path
+     * @param string|null               $wsPath  when set, expects a WebSocket upgrade at this path (`type=ws`)
+     * @param array<string, mixed>|null $reality when set (with `privateKey`), enables REALITY + XTLS Vision
      */
     public function __construct(
         public readonly string $host,
@@ -72,6 +94,7 @@ final class VlessServer
         public readonly ?string $cert = null,
         public readonly ?string $key = null,
         ?string $wsPath = null,
+        ?array $reality = null,
     ) {
         $hex = str_replace('-', '', $uuid);
 
@@ -82,16 +105,104 @@ final class VlessServer
         $this->uuid = hex2bin($hex);
         $trimmedPath = $wsPath !== null ? trim($wsPath) : '';
         $this->wsPath = $trimmedPath !== '' ? '/' . ltrim($trimmedPath, '/') : null;
+        $this->reality = self::normalizeReality($reality);
+    }
+
+    /**
+     * @param array<string, mixed>|null $cfg
+     * @return array{
+     *     privateKeyRaw: string,
+     *     publicKey: string,
+     *     destHost: string,
+     *     destPort: int,
+     *     serverNames: list<string>,
+     *     shortIds: list<string>,
+     *     primaryShortIdHex: string,
+     *     fingerprint: string,
+     *     flow: string,
+     *     maxTimeDiff: int
+     * }|null
+     */
+    private static function normalizeReality(?array $cfg): ?array
+    {
+        if ($cfg === null || !is_string($cfg['privateKey'] ?? null) || trim($cfg['privateKey']) === '') {
+            return null;
+        }
+        $privRaw = Reality::decodeKey($cfg['privateKey']);
+        $pubRaw = is_string($cfg['publicKey'] ?? null) && trim($cfg['publicKey']) !== ''
+            ? Reality::decodeKey($cfg['publicKey'])
+            : Reality::publicKeyFromPrivate($privRaw);
+        $pubEncoded = Reality::base64UrlEncode($pubRaw);
+
+        $dest = is_string($cfg['dest'] ?? null) && trim($cfg['dest']) !== '' ? trim($cfg['dest']) : 'www.apple.com:443';
+        if (str_contains($dest, ':')) {
+            [$destHost, $destPortStr] = explode(':', $dest, 2);
+            $destPort = ctype_digit($destPortStr) ? (int) $destPortStr : 443;
+        } else {
+            $destHost = $dest;
+            $destPort = 443;
+        }
+
+        $serverNames = [];
+        $rawSnis = $cfg['serverNames'] ?? (isset($cfg['serverName']) ? [$cfg['serverName']] : [$destHost]);
+        if (is_array($rawSnis)) {
+            foreach ($rawSnis as $s) {
+                if (is_string($s) && trim($s) !== '') {
+                    $serverNames[] = strtolower(trim($s));
+                }
+            }
+        }
+
+        $shortIds = [];
+        $primaryShortIdHex = '';
+        $rawSids = $cfg['shortIds'] ?? (isset($cfg['shortId']) ? [$cfg['shortId']] : ['']);
+        if (is_array($rawSids)) {
+            foreach ($rawSids as $sid) {
+                if (is_string($sid)) {
+                    $shortIds[] = Reality::decodeShortId($sid);
+                    if ($primaryShortIdHex === '' && trim($sid) !== '') {
+                        $primaryShortIdHex = strtolower(trim($sid));
+                    }
+                }
+            }
+        }
+        if ($shortIds === []) {
+            $shortIds[] = str_repeat("\x00", 8);
+        }
+
+        $fp = is_string($cfg['fingerprint'] ?? null) && trim($cfg['fingerprint']) !== ''
+            ? trim($cfg['fingerprint'])
+            : 'chrome';
+        $flow = is_string($cfg['flow'] ?? null) ? trim($cfg['flow']) : Vision::FLOW;
+        $maxTimeDiff = is_int($cfg['maxTimeDiff'] ?? null) ? max(0, $cfg['maxTimeDiff']) : 0;
+
+        return [
+            'privateKeyRaw' => $privRaw,
+            'publicKey' => $pubEncoded,
+            'destHost' => $destHost,
+            'destPort' => $destPort,
+            'serverNames' => $serverNames,
+            'shortIds' => $shortIds,
+            'primaryShortIdHex' => $primaryShortIdHex,
+            'fingerprint' => $fp,
+            'flow' => $flow,
+            'maxTimeDiff' => $maxTimeDiff,
+        ];
+    }
+
+    public function isReality(): bool
+    {
+        return $this->reality !== null;
     }
 
     public function isTls(): bool
     {
-        return $this->cert !== null && $this->key !== null;
+        return !$this->isReality() && $this->cert !== null && $this->key !== null;
     }
 
     public function isWs(): bool
     {
-        return $this->wsPath !== null;
+        return !$this->isReality() && $this->wsPath !== null;
     }
 
     /** @throws \RuntimeException when the port cannot be bound or the certificate cannot be read */
@@ -236,11 +347,38 @@ final class VlessServer
         $earlyPayload = '';
         $connecting = false;
         $far = null;
+        $vision = null;
+        $realityState = null;
+
+        $protocol = match (true) {
+            $this->isReality() => Reality::class,
+            $this->isWs() => Http::class,
+            default => Raw::class,
+        };
 
         $phone = new Connection(
             $client,
-            onMessage: function (Connection $phone, mixed $chunk) use (&$head, &$earlyPayload, &$connecting, &$far): void {
+            onMessage: function (Connection $phone, mixed $chunk) use (&$head, &$earlyPayload, &$connecting, &$far, &$vision, &$realityState): void {
                 if (is_array($chunk)) {
+                    if (isset($chunk['fallback'])) {
+                        // REALITY authentication failed: transparently forward raw bytes to dest
+                        $connecting = true;
+                        $earlyPayload = (string) $chunk['fallback'];
+                        $this->dialTarget(
+                            $phone,
+                            $this->reality['destHost'],
+                            $this->reality['destPort'],
+                            $earlyPayload,
+                            $connecting,
+                            $far,
+                            vision: null,
+                            realityState: null,
+                            sendResponseHeader: false,
+                        );
+
+                        return;
+                    }
+
                     $early = WsBinary::handshake($chunk, $phone, $this->wsPath);
                     if ($early === false) {
                         $phone->close();
@@ -253,14 +391,26 @@ final class VlessServer
                     $chunk = $early;
                 }
 
+                $bytes = (string) $chunk;
+
+                if ($vision !== null) {
+                    $unwrapped = $vision->unwrapUplink($bytes);
+                    $bytes = $unwrapped['data'];
+                    if ($unwrapped['switchedToDirect'] && $realityState !== null) {
+                        $realityState->directRead = true;
+                    }
+                }
+
                 if ($far !== null) {
-                    $far->sendRaw((string) $chunk);
+                    if ($bytes !== '') {
+                        $far->sendRaw($bytes);
+                    }
 
                     return;
                 }
 
                 if ($connecting) {
-                    $earlyPayload .= (string) $chunk;
+                    $earlyPayload .= $bytes;
                     if (strlen($earlyPayload) > TcpConnection::MAX_SEND_BUFFER) {
                         $phone->close();
                     }
@@ -268,7 +418,7 @@ final class VlessServer
                     return;
                 }
 
-                $head .= (string) $chunk;
+                $head .= $bytes;
                 $request = self::parse($head);
 
                 if ($request === null) {
@@ -297,53 +447,104 @@ final class VlessServer
                 $head = '';
                 $host = $request['host'];
                 $port = $request['port'];
-                $earlyPayload = $request['payload'];
+                $payload = $request['payload'];
 
-                if (self::needsDns($host)) {
-                    $connecting = true;
-                    Async::spawn(function () use ($phone, $host, $port, &$earlyPayload, &$connecting, &$far): void {
-                        try {
-                            $resolved = Dns::resolve($host, 10.0);
-                        } catch (\Throwable) {
-                            $phone->close();
-
-                            return;
+                if ($request['flow'] === Vision::FLOW) {
+                    $vision = new Vision($this->uuid);
+                    if ($payload !== '') {
+                        $unwrapped = $vision->unwrapUplink($payload);
+                        $payload = $unwrapped['data'];
+                        if ($unwrapped['switchedToDirect'] && $realityState !== null) {
+                            $realityState->directRead = true;
                         }
-
-                        if ($phone->isClosed()) {
-                            return;
-                        }
-
-                        $payload = $earlyPayload;
-                        $earlyPayload = '';
-                        $connecting = false;
-                        $far = $this->connect($phone, $resolved, $port, $payload);
-
-                        if ($far === null) {
-                            $phone->close();
-                        }
-                    });
+                    }
+                } elseif ($request['flow'] !== '') {
+                    Logger::debug("[vless] refused unsupported flow {$request['flow']}");
+                    $phone->close();
 
                     return;
                 }
 
-                $payload = $earlyPayload;
-                $earlyPayload = '';
-                $far = $this->connect($phone, $host, $port, $payload);
-
-                if ($far === null) {
-                    $phone->close();
-                }
+                $earlyPayload = $payload;
+                $this->dialTarget(
+                    $phone,
+                    $host,
+                    $port,
+                    $earlyPayload,
+                    $connecting,
+                    $far,
+                    $vision,
+                    $realityState,
+                    sendResponseHeader: true,
+                );
             },
             onClose: function () use (&$far, $id): void {
                 unset($this->connections[$id]);
                 $far?->close();
             },
-            protocol: $this->isWs() ? Http::class : Raw::class,
+            protocol: $protocol,
         );
+
+        if ($this->isReality()) {
+            $realityState = new Reality(
+                $this->reality['privateKeyRaw'],
+                $this->reality['serverNames'],
+                $this->reality['shortIds'],
+                $this->reality['maxTimeDiff'],
+            );
+            Reality::attach($phone, $realityState);
+        }
 
         $this->connections[$id] = $phone;
         $phone->setReadableWatcher(Loop::get()->onReadable($client, static fn () => $phone->onReadable()));
+    }
+
+    private function dialTarget(
+        Connection $phone,
+        string $host,
+        int $port,
+        string &$earlyPayload,
+        bool &$connecting,
+        ?Connection &$far,
+        ?Vision $vision,
+        ?Reality $realityState,
+        bool $sendResponseHeader,
+    ): void {
+        if (self::needsDns($host)) {
+            $connecting = true;
+            Async::spawn(function () use ($phone, $host, $port, &$earlyPayload, &$connecting, &$far, $vision, $realityState, $sendResponseHeader): void {
+                try {
+                    $resolved = Dns::resolve($host, 10.0);
+                } catch (\Throwable) {
+                    $phone->close();
+
+                    return;
+                }
+
+                if ($phone->isClosed()) {
+                    return;
+                }
+
+                $payload = $earlyPayload;
+                $earlyPayload = '';
+                $connecting = false;
+                $far = $this->connect($phone, $resolved, $port, $payload, $vision, $realityState, $sendResponseHeader);
+
+                if ($far === null) {
+                    $phone->close();
+                }
+            });
+
+            return;
+        }
+
+        $payload = $earlyPayload;
+        $earlyPayload = '';
+        $far = $this->connect($phone, $host, $port, $payload, $vision, $realityState, $sendResponseHeader);
+
+        if ($far === null) {
+            $phone->close();
+        }
     }
 
     private static function needsDns(string $host): bool
@@ -357,8 +558,15 @@ final class VlessServer
      *
      * @return Connection|null null when the connect could not even be started
      */
-    private function connect(Connection $phone, string $host, int $port, string $payload): ?Connection
-    {
+    private function connect(
+        Connection $phone,
+        string $host,
+        int $port,
+        string $payload,
+        ?Vision $vision = null,
+        ?Reality $realityState = null,
+        bool $sendResponseHeader = true,
+    ): ?Connection {
         $errno = 0;
         $errstr = '';
         $connectHost = strcasecmp($host, 'localhost') === 0 ? '127.0.0.1' : $host;
@@ -380,11 +588,26 @@ final class VlessServer
 
         stream_set_blocking($socket, false);
         $id = ++$this->nextId;
+        $sentResponseHeader = !$sendResponseHeader;
 
         $far = new Connection(
             $socket,
-            onMessage: static function (Connection $far, mixed $chunk) use ($phone): void {
-                $phone->send((string) $chunk);
+            onMessage: static function (Connection $far, mixed $chunk) use ($phone, $vision, $realityState, &$sentResponseHeader): void {
+                $prefix = '';
+                if (!$sentResponseHeader) {
+                    $prefix = "\x00\x00";
+                    $sentResponseHeader = true;
+                }
+                if ($vision !== null) {
+                    $wrapped = $vision->wrapDownlink((string) $chunk, $prefix);
+                    $phone->send($wrapped['framed']);
+                    if ($wrapped['switchToDirectAfterSend'] && $realityState !== null) {
+                        $realityState->directWrite = true;
+                    }
+
+                    return;
+                }
+                $phone->send($prefix . (string) $chunk);
             },
             onClose: function () use ($phone, $id): void {
                 unset($this->connections[$id]);
@@ -397,7 +620,7 @@ final class VlessServer
 
         // Connected or refused shows as writable; `stream_socket_get_name(…, true)` says which.
         $probe = null;
-        $probe = Loop::get()->onWritable($socket, function () use (&$probe, $socket, $far, $phone, $payload, $target): void {
+        $probe = Loop::get()->onWritable($socket, function () use (&$probe, $socket, $far, $phone, $payload, $target, $vision, &$sentResponseHeader): void {
             Loop::get()->cancel((string) $probe);
 
             if (stream_socket_get_name($socket, true) === false) {
@@ -408,7 +631,10 @@ final class VlessServer
             }
 
             $far->setReadableWatcher(Loop::get()->onReadable($socket, static fn () => $far->onReadable()));
-            $phone->send("\x00\x00"); // the response header: version 0, no addons
+            if (!$sentResponseHeader && $vision === null) {
+                $sentResponseHeader = true;
+                $phone->send("\x00\x00"); // the response header: version 0, no addons
+            }
 
             if ($payload !== '') {
                 $far->sendRaw($payload);
@@ -421,7 +647,7 @@ final class VlessServer
     /**
      * The request header.
      *
-     * @return array{uuid: string, command: int, host: string, port: int, payload: string}|null|false
+     * @return array{uuid: string, flow: string, command: int, host: string, port: int, payload: string}|null|false
      *         null while the bytes so far are a prefix of a header, false when they cannot be one
      */
     public static function parse(string $bytes): array|null|false
@@ -441,13 +667,14 @@ final class VlessServer
         }
 
         $uuid = substr($bytes, 1, 16);
-        $addons = ord($bytes[17]);
-        $at = 18 + $addons;
+        $addonsLen = ord($bytes[17]);
+        $at = 18 + $addonsLen;
 
         if ($length < $at + 4) {
             return null;
         }
 
+        $flow = $addonsLen > 0 ? Vision::decodeAddonsFlow(substr($bytes, 18, $addonsLen)) : '';
         $command = ord($bytes[$at]);
         $port = unpack('n', substr($bytes, $at + 1, 2))[1];
         $type = ord($bytes[$at + 3]);
@@ -495,7 +722,14 @@ final class VlessServer
             return false;
         }
 
-        return ['uuid' => $uuid, 'command' => $command, 'host' => $host, 'port' => $port, 'payload' => substr($bytes, $at)];
+        return [
+            'uuid' => $uuid,
+            'flow' => $flow,
+            'command' => $command,
+            'host' => $host,
+            'port' => $port,
+            'payload' => substr($bytes, $at),
+        ];
     }
 
     /** The link a phone scans or pastes. */
@@ -503,6 +737,28 @@ final class VlessServer
     {
         $uuid = bin2hex($this->uuid);
         $uuid = substr($uuid, 0, 8) . '-' . substr($uuid, 8, 4) . '-' . substr($uuid, 12, 4) . '-' . substr($uuid, 16, 4) . '-' . substr($uuid, 20);
+
+        if ($this->isReality()) {
+            $r = $this->reality;
+            $sni = $r['serverNames'][0] ?? $r['destHost'];
+            $params = [
+                'encryption=none',
+                'security=reality',
+                'type=tcp',
+            ];
+            if ($r['flow'] !== '') {
+                $params[] = 'flow=' . rawurlencode($r['flow']);
+            }
+            $params[] = 'sni=' . rawurlencode($sni);
+            $params[] = 'fp=' . rawurlencode($r['fingerprint']);
+            $params[] = 'pbk=' . rawurlencode($r['publicKey']);
+            if ($r['primaryShortIdHex'] !== '') {
+                $params[] = 'sid=' . rawurlencode($r['primaryShortIdHex']);
+            }
+
+            return "vless://{$uuid}@{$host}:{$this->port}?" . implode('&', $params) . '#' . rawurlencode($name);
+        }
+
         $security = $this->isTls() ? 'tls' : 'none';
         $transport = $this->wsPath !== null
             ? 'type=ws&path=' . rawurlencode($this->wsPath)

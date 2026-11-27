@@ -188,6 +188,382 @@ final class VlessServerTest extends TestCase
         }
     }
 
+    public function testRealityShareLinkAndKeygenFormat(): void
+    {
+        $pair = \PigVless\Reality::generateKeyPair();
+        $this->assertSame(32, strlen(\PigVless\Reality::decodeKey($pair['privateKey'])));
+        $this->assertSame(
+            $pair['publicKey'],
+            \PigVless\Reality::base64UrlEncode(\PigVless\Reality::publicKeyFromPrivate(\PigVless\Reality::decodeKey($pair['privateKey']))),
+        );
+
+        $rServer = new VlessServer('127.0.0.1', self::freePort(), self::UUID, reality: [
+            'privateKey' => $pair['privateKey'],
+            'dest' => "127.0.0.1:{$this->echoPort}",
+            'serverNames' => ['www.apple.com'],
+            'shortIds' => ['a1b2c3d4'],
+            'fingerprint' => 'chrome',
+        ]);
+
+        $this->assertTrue($rServer->isReality());
+        $link = $rServer->shareLink('203.0.113.10', 'reality-node');
+        $this->assertSame(
+            'vless://' . self::UUID . "@203.0.113.10:{$rServer->port}?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=www.apple.com&fp=chrome&pbk={$pair['publicKey']}&sid=a1b2c3d4#reality-node",
+            $link,
+        );
+    }
+
+    public function testRealityUnauthorizedProbeFallsBackTransparentlyToDest(): void
+    {
+        $pair = \PigVless\Reality::generateKeyPair();
+        $rServer = new VlessServer('127.0.0.1', self::freePort(), self::UUID, reality: [
+            'privateKey' => $pair['privateKey'],
+            'dest' => "127.0.0.1:{$this->echoPort}",
+            'serverNames' => ['www.apple.com'],
+            'shortIds' => ['a1b2c3d4'],
+        ]);
+        $rServer->start();
+
+        try {
+            // 1. Plain HTTP probe (not TLS) -> forwarded to dest (echoes uppercase)
+            $replyHttp = Async::run(function () use ($rServer): string {
+                $socket = Socket::connect('127.0.0.1', $rServer->port, timeout: 2.0);
+                $socket->write('probe-fallback', 2.0);
+                $got = (string) $socket->read(65536, 1.0);
+                $socket->close();
+
+                return $got;
+            });
+            $this->assertSame('PROBE-FALLBACK', $replyHttp);
+
+            // 2. TLS 1.3 ClientHello with wrong shortId -> forwarded raw to dest
+            $badHello = \PigVless\Reality::buildClientHello(
+                \PigVless\Reality::decodeKey($pair['publicKey']),
+                'www.apple.com',
+                \PigVless\Reality::decodeShortId('deadbeef'),
+            );
+            $replyBadSid = Async::run(function () use ($rServer, $badHello): string {
+                $socket = Socket::connect('127.0.0.1', $rServer->port, timeout: 2.0);
+                $socket->write($badHello['record'], 2.0);
+                $got = (string) $socket->read(65536, 1.0);
+                $socket->close();
+
+                return $got;
+            });
+            $this->assertSame(strtoupper($badHello['record']), $replyBadSid);
+        } finally {
+            $rServer->stop();
+        }
+    }
+
+    public function testRealityHandshakeHmacCertAndVisionZeroCopyDirectSplice(): void
+    {
+        $pair = \PigVless\Reality::generateKeyPair();
+        $pubRaw = \PigVless\Reality::decodeKey($pair['publicKey']);
+        $sidRaw = \PigVless\Reality::decodeShortId('a1b2c3d4');
+
+        $rServer = new VlessServer('127.0.0.1', self::freePort(), self::UUID, reality: [
+            'privateKey' => $pair['privateKey'],
+            'dest' => "127.0.0.1:{$this->echoPort}",
+            'serverNames' => ['www.apple.com'],
+            'shortIds' => ['a1b2c3d4'],
+        ]);
+        $rServer->start();
+
+        try {
+            $ch = \PigVless\Reality::buildClientHello($pubRaw, 'www.apple.com', $sidRaw);
+
+            Async::run(function () use ($rServer, $ch): void {
+                $socket = Socket::connect('127.0.0.1', $rServer->port, timeout: 2.0);
+                $socket->write($ch['record'], 2.0);
+
+                // Read ServerHello + ChangeCipherSpec + 4 encrypted handshake records
+                $buf = '';
+                $records = [];
+                while (count($records) < 6) {
+                    $chunk = $socket->read(65536, 2.0);
+                    if ($chunk === null || $chunk === '') {
+                        break;
+                    }
+                    $buf .= $chunk;
+                    while (strlen($buf) >= 5) {
+                        $rLen = unpack('n', substr($buf, 3, 2))[1];
+                        if (strlen($buf) < 5 + $rLen) {
+                            break;
+                        }
+                        $records[] = substr($buf, 0, 5 + $rLen);
+                        $buf = substr($buf, 5 + $rLen);
+                    }
+                }
+
+                $this->assertCount(6, $records, 'ServerHello + CCS + EE + Cert + CV + Finished');
+                $shRec = $records[0];
+                $this->assertSame("\x16\x03\x03", substr($shRec, 0, 3));
+                $shMsg = substr($shRec, 5);
+                // Extract server's ephemeral X25519 public key (last 32 bytes of ServerHello)
+                $serverEphPub = substr($shMsg, -32);
+                $tlsShared = \PigVless\Reality::x25519Ecdh($ch['clientEphPriv'], $serverEphPub);
+                $this->assertNotFalse($tlsShared);
+
+                $transcript = $ch['rawHandshake'] . $shMsg;
+                $early = \PigVless\Reality::hkdfExtract('sha256', '', '');
+                $derivedEarly = \PigVless\Reality::deriveSecret('sha256', $early, 'derived', '');
+                $hsSecret = \PigVless\Reality::hkdfExtract('sha256', $derivedEarly, $tlsShared);
+
+                $cHsTraffic = \PigVless\Reality::deriveSecret('sha256', $hsSecret, 'c hs traffic', $transcript);
+                $sHsTraffic = \PigVless\Reality::deriveSecret('sha256', $hsSecret, 's hs traffic', $transcript);
+
+                $cHsKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'key', '', 16);
+                $cHsIv = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'iv', '', 12);
+                $sHsKey = \PigVless\Reality::hkdfExpandLabel('sha256', $sHsTraffic, 'key', '', 16);
+                $sHsIv = \PigVless\Reality::hkdfExpandLabel('sha256', $sHsTraffic, 'iv', '', 12);
+                $sHsSeq = 0;
+
+                // Decrypt EncryptedExtensions, Certificate, CertificateVerify, Finished
+                $ee = \PigVless\Reality::decryptRecord('aes-128-gcm', $sHsKey, $sHsIv, $sHsSeq, $records[2]);
+                $cert = \PigVless\Reality::decryptRecord('aes-128-gcm', $sHsKey, $sHsIv, $sHsSeq, $records[3]);
+                $cv = \PigVless\Reality::decryptRecord('aes-128-gcm', $sHsKey, $sHsIv, $sHsSeq, $records[4]);
+                $fin = \PigVless\Reality::decryptRecord('aes-128-gcm', $sHsKey, $sHsIv, $sHsSeq, $records[5]);
+
+                $this->assertNotFalse($ee);
+                $this->assertNotFalse($cert);
+                $this->assertNotFalse($cv);
+                $this->assertNotFalse($fin);
+
+                // Verify REALITY temporary Ed25519 certificate HMAC-SHA512 signature!
+                $certDer = substr($cert['content'], 11, -2);
+                $edPubInCert = substr($certDer, -106, 32);
+                $hmacInCert = substr($certDer, -64);
+                $expectedHmac = hash_hmac('sha512', $edPubInCert, $ch['authKey'], true);
+                $this->assertSame(bin2hex($expectedHmac), bin2hex($hmacInCert), 'REALITY Ed25519 certificate carries HMAC-SHA512(authKey, ed25519Pub)');
+
+                $transcript .= $ee['content'] . $cert['content'] . $cv['content'] . $fin['content'];
+
+                $derivedHs = \PigVless\Reality::deriveSecret('sha256', $hsSecret, 'derived', '');
+                $master = \PigVless\Reality::hkdfExtract('sha256', $derivedHs, '');
+                $cAppTraffic = \PigVless\Reality::deriveSecret('sha256', $master, 'c ap traffic', $transcript);
+                $sAppTraffic = \PigVless\Reality::deriveSecret('sha256', $master, 's ap traffic', $transcript);
+
+                $cAppKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cAppTraffic, 'key', '', 16);
+                $cAppIv = \PigVless\Reality::hkdfExpandLabel('sha256', $cAppTraffic, 'iv', '', 12);
+                $sAppKey = \PigVless\Reality::hkdfExpandLabel('sha256', $sAppTraffic, 'key', '', 16);
+                $sAppIv = \PigVless\Reality::hkdfExpandLabel('sha256', $sAppTraffic, 'iv', '', 12);
+
+                // Send Client Finished
+                $cFinKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'finished', '', 32);
+                $cFinVerify = hash_hmac('sha256', hash('sha256', $transcript, true), $cFinKey, true);
+                $cFinMsg = "\x14" . substr(pack('N', strlen($cFinVerify)), 1, 3) . $cFinVerify;
+                $cHsSeq = 0;
+                $socket->write(\PigVless\Reality::encryptRecord('aes-128-gcm', $cHsKey, $cHsIv, $cHsSeq, $cFinMsg, 0x16), 2.0);
+
+                // Send VLESS request with flow=xtls-rprx-vision + Vision-padded block switching to CMD_DIRECT (2)
+                $uuidRaw = hex2bin(str_replace('-', '', self::UUID));
+                $vlessReq = self::header(self::UUID, VlessServer::CMD_TCP, '127.0.0.1', $this->echoPort, \PigVless\Vision::FLOW);
+                $clientVision = new \PigVless\Vision($uuidRaw);
+                $visionBlock = $clientVision->padBlock('vision-payload', \PigVless\Vision::CMD_DIRECT, true, 32);
+
+                $cAppSeq = 0;
+                $socket->write(\PigVless\Reality::encryptRecord('aes-128-gcm', $cAppKey, $cAppIv, $cAppSeq, $vlessReq . $visionBlock, 0x17), 2.0);
+
+                // Read encrypted outer TLS 1.3 response containing VLESS response header + Vision-padded echo reply
+                $replyRec = (string) $socket->read(65536, 2.0);
+                $sAppSeq = 0;
+                $decReply = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $replyRec);
+                $this->assertNotFalse($decReply);
+                $this->assertSame("\x00\x00", substr($decReply['content'], 0, 2));
+                $unpadded = $clientVision->unwrapUplink(substr($decReply['content'], 2));
+                $this->assertSame('VISION-PAYLOAD', $unpadded['data']);
+
+                // Because uplink sent CMD_DIRECT (2), subsequent uplink bytes go RAW without outer TLS encryption!
+                $socket->write('raw-splice-after-direct', 2.0);
+                $replyRec2 = (string) $socket->read(65536, 2.0);
+                $decReply2 = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $replyRec2);
+                $this->assertNotFalse($decReply2);
+                $unpadded2 = $clientVision->unwrapUplink($decReply2['content']);
+                $this->assertSame('RAW-SPLICE-AFTER-DIRECT', $unpadded2['data']);
+
+                $socket->close();
+            });
+        } finally {
+            $rServer->stop();
+        }
+    }
+
+    public function testVisionDownlinkFiltersInnerTls13AndSwitchesToDirectSplice(): void
+    {
+        $pair = \PigVless\Reality::generateKeyPair();
+        $pubRaw = \PigVless\Reality::decodeKey($pair['publicKey']);
+        $sidRaw = \PigVless\Reality::decodeShortId('a1b2c3d4');
+
+        // Mock an inner TLS 1.3 destination server that replies with a TLS 1.3 ServerHello + ApplicationData
+        $innerPort = self::freePort();
+        $innerServer = stream_socket_server("tcp://127.0.0.1:{$innerPort}") ?: throw new RuntimeException('no inner tls');
+        stream_set_blocking($innerServer, false);
+        $innerClients = [];
+        $innerWatcher = Loop::get()->onReadable($innerServer, function () use ($innerServer, &$innerClients): void {
+            set_error_handler(static fn (): bool => true);
+            try {
+                $c = stream_socket_accept($innerServer, 0);
+            } finally {
+                restore_error_handler();
+            }
+            if ($c === false) {
+                return;
+            }
+            stream_set_blocking($c, false);
+            $innerClients[] = $c;
+            Loop::get()->onReadable($c, static function () use ($c): void {
+                $in = fread($c, 65536);
+                if ($in === false || $in === '') {
+                    return;
+                }
+                // Build a realistic inner TLS 1.3 ServerHello record (>= 79 bytes, cipher 0x1301, supported_versions 0x002b 0x0002 0x0304)
+                $shBody = "\x03\x03" . str_repeat("\x11", 32) . "\x20" . str_repeat("\x22", 32) . "\x13\x01\x00"
+                    . "\x00\x06\x00\x2b\x00\x02\x03\x04";
+                $shMsg = "\x02" . substr(pack('N', strlen($shBody)), 1, 3) . $shBody;
+                $shRecord = "\x16\x03\x03" . pack('n', strlen($shMsg)) . $shMsg;
+                fwrite($c, $shRecord);
+
+                // Next write: a complete inner TLS 1.3 ApplicationData record -> triggers Vision CMD_DIRECT (2) + outer directWrite!
+                $appRecord1 = "\x17\x03\x03\x00\x0cINNER-APP-01";
+                fwrite($c, $appRecord1);
+            });
+        });
+
+        $rServer = new VlessServer('127.0.0.1', self::freePort(), self::UUID, reality: [
+            'privateKey' => $pair['privateKey'],
+            'dest' => "127.0.0.1:{$this->echoPort}",
+            'serverNames' => ['www.apple.com'],
+            'shortIds' => ['a1b2c3d4'],
+        ]);
+        $rServer->start();
+
+        try {
+            $ch = \PigVless\Reality::buildClientHello($pubRaw, 'www.apple.com', $sidRaw);
+
+            Async::run(function () use ($rServer, $innerPort, $ch, &$innerClients): void {
+                $socket = Socket::connect('127.0.0.1', $rServer->port, timeout: 2.0);
+                $socket->write($ch['record'], 2.0);
+
+                $buf = '';
+                $records = [];
+                while (count($records) < 6) {
+                    $chunk = $socket->read(65536, 2.0);
+                    if ($chunk === null || $chunk === '') {
+                        break;
+                    }
+                    $buf .= $chunk;
+                    while (strlen($buf) >= 5) {
+                        $rLen = unpack('n', substr($buf, 3, 2))[1];
+                        if (strlen($buf) < 5 + $rLen) {
+                            break;
+                        }
+                        $records[] = substr($buf, 0, 5 + $rLen);
+                        $buf = substr($buf, 5 + $rLen);
+                    }
+                }
+
+                $shMsg = substr($records[0], 5);
+                $serverEphPub = substr($shMsg, -32);
+                $tlsShared = \PigVless\Reality::x25519Ecdh($ch['clientEphPriv'], $serverEphPub);
+                $transcript = $ch['rawHandshake'] . $shMsg;
+                $early = \PigVless\Reality::hkdfExtract('sha256', '', '');
+                $hsSecret = \PigVless\Reality::hkdfExtract('sha256', \PigVless\Reality::deriveSecret('sha256', $early, 'derived', ''), $tlsShared);
+                $cHsTraffic = \PigVless\Reality::deriveSecret('sha256', $hsSecret, 'c hs traffic', $transcript);
+                $sHsTraffic = \PigVless\Reality::deriveSecret('sha256', $hsSecret, 's hs traffic', $transcript);
+                $cHsKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'key', '', 16);
+                $cHsIv = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'iv', '', 12);
+                $sHsKey = \PigVless\Reality::hkdfExpandLabel('sha256', $sHsTraffic, 'key', '', 16);
+                $sHsIv = \PigVless\Reality::hkdfExpandLabel('sha256', $sHsTraffic, 'iv', '', 12);
+                $sHsSeq = 0;
+
+                foreach ([2, 3, 4, 5] as $idx) {
+                    $dec = \PigVless\Reality::decryptRecord('aes-128-gcm', $sHsKey, $sHsIv, $sHsSeq, $records[$idx]);
+                    $transcript .= $dec['content'];
+                }
+
+                $master = \PigVless\Reality::hkdfExtract('sha256', \PigVless\Reality::deriveSecret('sha256', $hsSecret, 'derived', ''), '');
+                $cAppTraffic = \PigVless\Reality::deriveSecret('sha256', $master, 'c ap traffic', $transcript);
+                $sAppTraffic = \PigVless\Reality::deriveSecret('sha256', $master, 's ap traffic', $transcript);
+                $cAppKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cAppTraffic, 'key', '', 16);
+                $cAppIv = \PigVless\Reality::hkdfExpandLabel('sha256', $cAppTraffic, 'iv', '', 12);
+                $sAppKey = \PigVless\Reality::hkdfExpandLabel('sha256', $sAppTraffic, 'key', '', 16);
+                $sAppIv = \PigVless\Reality::hkdfExpandLabel('sha256', $sAppTraffic, 'iv', '', 12);
+
+                $cFinKey = \PigVless\Reality::hkdfExpandLabel('sha256', $cHsTraffic, 'finished', '', 32);
+                $cFinVerify = hash_hmac('sha256', hash('sha256', $transcript, true), $cFinKey, true);
+                $cFinMsg = "\x14" . substr(pack('N', strlen($cFinVerify)), 1, 3) . $cFinVerify;
+                $cHsSeq = 0;
+                $socket->write(\PigVless\Reality::encryptRecord('aes-128-gcm', $cHsKey, $cHsIv, $cHsSeq, $cFinMsg, 0x16), 2.0);
+
+                // Send VLESS request + inner TLS ClientHello (0x16 0x03 0x01 0x00 0x08 0x01 ...)
+                $uuidRaw = hex2bin(str_replace('-', '', self::UUID));
+                $vlessReq = self::header(self::UUID, VlessServer::CMD_TCP, '127.0.0.1', $innerPort, \PigVless\Vision::FLOW);
+                $clientVision = new \PigVless\Vision($uuidRaw);
+                $innerCh = "\x16\x03\x01\x00\x08\x01\x00\x00\x04\x03\x03\xaa\xbb";
+                $visionBlock = $clientVision->padBlock($innerCh, \PigVless\Vision::CMD_CONTINUE, true, 16);
+                $cAppSeq = 0;
+                $socket->write(\PigVless\Reality::encryptRecord('aes-128-gcm', $cAppKey, $cAppIv, $cAppSeq, $vlessReq . $visionBlock, 0x17), 2.0);
+
+                // Read outer encrypted TLS 1.3 records until Vision downlink signals CMD_DIRECT (switchedToDirect = true)
+                $sAppSeq = 0;
+                $downlinkVision = new \PigVless\Vision($uuidRaw);
+                $gotHeader = false;
+                $unpaddedDownlink = '';
+                $switchedDownlink = false;
+
+                while (!$switchedDownlink) {
+                    $chunk = $socket->read(65536, 2.0);
+                    if ($chunk === null || $chunk === '') {
+                        break;
+                    }
+                    $buf .= $chunk;
+                    while (strlen($buf) >= 5) {
+                        $rLen = unpack('n', substr($buf, 3, 2))[1];
+                        if (strlen($buf) < 5 + $rLen) {
+                            break;
+                        }
+                        $rec = substr($buf, 0, 5 + $rLen);
+                        $buf = substr($buf, 5 + $rLen);
+                        $dec = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $rec);
+                        $this->assertNotFalse($dec);
+                        $payload = $dec['content'];
+                        if (!$gotHeader) {
+                            $this->assertSame("\x00\x00", substr($payload, 0, 2));
+                            $payload = substr($payload, 2);
+                            $gotHeader = true;
+                        }
+                        $res = $downlinkVision->unwrapUplink($payload);
+                        $unpaddedDownlink .= $res['data'];
+                        if ($res['switchedToDirect']) {
+                            $switchedDownlink = true;
+                            break;
+                        }
+                    }
+                }
+
+                $this->assertTrue($switchedDownlink, 'Vision downlink detected inner TLS 1.3 and switched to CMD_DIRECT (2)');
+                $this->assertStringEndsWith("\x17\x03\x03\x00\x0cINNER-APP-01", $unpaddedDownlink);
+
+                // Now that downlink switched to directWrite, the inner destination sends a second TLS record and it arrives RAW without outer TLS encryption!
+                fwrite($innerClients[0], "\x17\x03\x03\x00\x0cRAW-SPLICE-2");
+                $rawDownlink = $buf !== '' ? $buf : (string) $socket->read(65536, 2.0);
+                $this->assertSame("\x17\x03\x03\x00\x0cRAW-SPLICE-2", $rawDownlink);
+
+                $socket->close();
+            });
+        } finally {
+            $rServer->stop();
+            Loop::get()->cancel($innerWatcher);
+            foreach ($innerClients as $c) {
+                if (is_resource($c)) {
+                    fclose($c);
+                }
+            }
+            fclose($innerServer);
+        }
+    }
+
     // ---- the phone -------------------------------------------------------------------------
 
     private function through(string $first, string $then = ''): string
@@ -228,15 +604,16 @@ final class VlessServerTest extends TestCase
         });
     }
 
-    private static function header(string $uuid, int $command, string $host, int $port): string
+    private static function header(string $uuid, int $command, string $host, int $port, string $flow = ''): string
     {
         $address = match (true) {
             filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false => "\x01" . inet_pton($host),
             filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false => "\x03" . inet_pton($host),
             default => "\x02" . chr(strlen($host)) . $host,
         };
+        $addons = \PigVless\Vision::encodeAddonsFlow($flow);
 
-        return "\x00" . hex2bin(str_replace('-', '', $uuid)) . "\x00" . chr($command) . pack('n', $port) . $address;
+        return "\x00" . hex2bin(str_replace('-', '', $uuid)) . chr(strlen($addons)) . $addons . chr($command) . pack('n', $port) . $address;
     }
 
     private static function maskedBinaryFrame(string $payload): string
