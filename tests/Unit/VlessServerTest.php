@@ -51,14 +51,16 @@ final class VlessServerTest extends TestCase
             }
 
             stream_set_blocking($client, false);
-            $this->echoClients[] = $client;
-            Loop::get()->onReadable($client, static function () use ($client): void {
-                $data = fread($client, 65536);
+            $this->echoClients[] = [
+                'socket' => $client,
+                'watcher' => Loop::get()->onReadable($client, static function () use ($client): void {
+                    $data = fread($client, 65536);
 
-                if ($data !== false && $data !== '') {
-                    fwrite($client, strtoupper($data));
-                }
-            });
+                    if ($data !== false && $data !== '') {
+                        fwrite($client, strtoupper($data));
+                    }
+                }),
+            ];
         });
 
         $this->server = new VlessServer('127.0.0.1', self::freePort(), self::UUID);
@@ -69,6 +71,14 @@ final class VlessServerTest extends TestCase
     protected function tearDown(): void
     {
         $this->server->stop();
+
+        foreach ($this->echoClients as $ec) {
+            Loop::get()->cancel($ec['watcher']);
+            if (is_resource($ec['socket'])) {
+                fclose($ec['socket']);
+            }
+        }
+        $this->echoClients = [];
 
         if ($this->echoWatcher !== null) {
             Loop::get()->cancel($this->echoWatcher);
@@ -411,8 +421,8 @@ final class VlessServerTest extends TestCase
                 return;
             }
             stream_set_blocking($c, false);
-            $innerClients[] = $c;
-            Loop::get()->onReadable($c, static function () use ($c): void {
+            $w = null;
+            $w = Loop::get()->onReadable($c, static function () use ($c): void {
                 $in = fread($c, 65536);
                 if ($in === false || $in === '') {
                     return;
@@ -423,11 +433,9 @@ final class VlessServerTest extends TestCase
                 $shMsg = "\x02" . substr(pack('N', strlen($shBody)), 1, 3) . $shBody;
                 $shRecord = "\x16\x03\x03" . pack('n', strlen($shMsg)) . $shMsg;
                 fwrite($c, $shRecord);
-
-                // Next write: a complete inner TLS 1.3 ApplicationData record -> triggers Vision CMD_DIRECT (2) + outer directWrite!
-                $appRecord1 = "\x17\x03\x03\x00\x0cINNER-APP-01";
-                fwrite($c, $appRecord1);
+                fflush($c);
             });
+            $innerClients[] = ['socket' => $c, 'watcher' => $w];
         });
 
         $rServer = new VlessServer('127.0.0.1', self::freePort(), self::UUID, reality: [
@@ -505,49 +513,28 @@ final class VlessServerTest extends TestCase
                 $cAppSeq = 0;
                 $socket->write(\PigVless\Reality::encryptRecord('aes-128-gcm', $cAppKey, $cAppIv, $cAppSeq, $vlessReq . $visionBlock, 0x17), 2.0);
 
-                // Read outer encrypted TLS 1.3 records until Vision downlink signals CMD_DIRECT (switchedToDirect = true)
+                // Read first downlink Vision block (contains VLESS response header + inner ServerHello)
                 $sAppSeq = 0;
                 $downlinkVision = new \PigVless\Vision($uuidRaw);
-                $gotHeader = false;
-                $unpaddedDownlink = '';
-                $switchedDownlink = false;
+                $rec1 = (string) $socket->read(65536, 2.0);
+                $dec1 = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $rec1);
+                $this->assertNotFalse($dec1);
+                $this->assertSame("\x00\x00", substr($dec1['content'], 0, 2));
+                $res1 = $downlinkVision->unwrapUplink(substr($dec1['content'], 2));
+                $this->assertFalse($res1['switchedToDirect']);
 
-                while (!$switchedDownlink) {
-                    $chunk = $socket->read(65536, 2.0);
-                    if ($chunk === null || $chunk === '') {
-                        break;
-                    }
-                    $buf .= $chunk;
-                    while (strlen($buf) >= 5) {
-                        $rLen = unpack('n', substr($buf, 3, 2))[1];
-                        if (strlen($buf) < 5 + $rLen) {
-                            break;
-                        }
-                        $rec = substr($buf, 0, 5 + $rLen);
-                        $buf = substr($buf, 5 + $rLen);
-                        $dec = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $rec);
-                        $this->assertNotFalse($dec);
-                        $payload = $dec['content'];
-                        if (!$gotHeader) {
-                            $this->assertSame("\x00\x00", substr($payload, 0, 2));
-                            $payload = substr($payload, 2);
-                            $gotHeader = true;
-                        }
-                        $res = $downlinkVision->unwrapUplink($payload);
-                        $unpaddedDownlink .= $res['data'];
-                        if ($res['switchedToDirect']) {
-                            $switchedDownlink = true;
-                            break;
-                        }
-                    }
-                }
-
-                $this->assertTrue($switchedDownlink, 'Vision downlink detected inner TLS 1.3 and switched to CMD_DIRECT (2)');
-                $this->assertStringEndsWith("\x17\x03\x03\x00\x0cINNER-APP-01", $unpaddedDownlink);
+                // Next write from inner destination: a complete inner TLS 1.3 ApplicationData record -> triggers Vision CMD_DIRECT (2) + outer directWrite!
+                fwrite($innerClients[0]['socket'], "\x17\x03\x03\x00\x0cINNER-APP-01");
+                $rec2 = (string) $socket->read(65536, 2.0);
+                $dec2 = \PigVless\Reality::decryptRecord('aes-128-gcm', $sAppKey, $sAppIv, $sAppSeq, $rec2);
+                $this->assertNotFalse($dec2);
+                $res2 = $downlinkVision->unwrapUplink($dec2['content']);
+                $this->assertTrue($res2['switchedToDirect'], 'Vision downlink detected inner TLS 1.3 ApplicationData and switched to CMD_DIRECT (2)');
+                $this->assertSame("\x17\x03\x03\x00\x0cINNER-APP-01", $res2['data']);
 
                 // Now that downlink switched to directWrite, the inner destination sends a second TLS record and it arrives RAW without outer TLS encryption!
-                fwrite($innerClients[0], "\x17\x03\x03\x00\x0cRAW-SPLICE-2");
-                $rawDownlink = $buf !== '' ? $buf : (string) $socket->read(65536, 2.0);
+                fwrite($innerClients[0]['socket'], "\x17\x03\x03\x00\x0cRAW-SPLICE-2");
+                $rawDownlink = (string) $socket->read(65536, 2.0);
                 $this->assertSame("\x17\x03\x03\x00\x0cRAW-SPLICE-2", $rawDownlink);
 
                 $socket->close();
@@ -555,9 +542,10 @@ final class VlessServerTest extends TestCase
         } finally {
             $rServer->stop();
             Loop::get()->cancel($innerWatcher);
-            foreach ($innerClients as $c) {
-                if (is_resource($c)) {
-                    fclose($c);
+            foreach ($innerClients as $ic) {
+                Loop::get()->cancel($ic['watcher']);
+                if (is_resource($ic['socket'])) {
+                    fclose($ic['socket']);
                 }
             }
             fclose($innerServer);
